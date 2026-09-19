@@ -1,0 +1,102 @@
+name: Build provenance executable fixture
+
+on:
+  workflow_call:
+    inputs:
+      candidate_slot:
+        description: Only the bounded executable-a slot is accepted.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build-and-attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out caller source at the triggering ref
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build the bounded executable candidate without running it
+        id: candidate
+        shell: bash
+        env:
+          CANDIDATE_SLOT: ${{ inputs.candidate_slot }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$CANDIDATE_SLOT" = "executable-a"
+          test "$CALLER_REPOSITORY" = "dupersecretaccountblahh/white01-provenance-producer"
+          [[ "$CALLER_REF" == refs/heads/* ]]
+          test -f candidate.c
+          test ! -L candidate.c
+          test ! -x candidate.c
+          test "$(wc -c < candidate.c)" -le 4096
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path("candidate.c").read_bytes()
+          source.decode("utf-8")
+          if b"\x00" in source:
+              raise SystemExit("NUL byte rejected")
+          PY
+
+          mkdir -p attested-output
+          cc -std=c11 -O2 -fPIE -pie -Wl,-z,relro,-z,now \
+            -o attested-output/candidate.bin candidate.c
+          test -x attested-output/candidate.bin
+          file attested-output/candidate.bin | tee attested-output/file-type.txt
+          grep -F 'ELF 64-bit LSB pie executable, x86-64' attested-output/file-type.txt >/dev/null
+
+          source_sha256="$(sha256sum candidate.c | cut -d' ' -f1)"
+          candidate_sha256="$(sha256sum attested-output/candidate.bin | cut -d' ' -f1)"
+          compiler="$(cc --version | sed -n '1p')"
+          jq -n \
+            --arg schema "white01-provenance-executable-producer-receipt-v1" \
+            --arg repository "$CALLER_REPOSITORY" \
+            --arg source_ref "$CALLER_REF" \
+            --arg source_sha "$CALLER_SHA" \
+            --arg source_sha256 "$source_sha256" \
+            --arg candidate_sha256 "$candidate_sha256" \
+            --arg compiler "$compiler" \
+            '{schema:$schema, repository:$repository, source_ref:$source_ref, source_sha:$source_sha, source_sha256:$source_sha256, candidate_sha256:$candidate_sha256, compiler:$compiler, candidate_executed:false}' \
+            > attested-output/producer-receipt.json
+
+      - name: Generate authentic GitHub provenance for the executable
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: attested-output/candidate.bin
+
+      - name: Stage the exact Sigstore bundle
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -f "$BUNDLE_PATH"
+          install -m 0644 "$BUNDLE_PATH" attested-output/attestation.sigstore.json
+          sha256sum \
+            attested-output/candidate.bin \
+            attested-output/attestation.sigstore.json \
+            attested-output/file-type.txt \
+            attested-output/producer-receipt.json \
+            > attested-output/SHA256SUMS
+
+      - name: Publish the immutable executable fixture
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: white01-provenance-executable-a
+          path: attested-output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
