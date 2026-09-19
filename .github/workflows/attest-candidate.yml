@@ -1,0 +1,88 @@
+name: Publish provenance fixture
+
+on:
+  workflow_call:
+    inputs:
+      candidate_slot:
+        description: Only the bounded fixture-a slot is accepted.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out the caller repository and triggering ref
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Admit only the fixed data candidate
+        id: candidate
+        shell: bash
+        env:
+          CANDIDATE_SLOT: ${{ inputs.candidate_slot }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$CANDIDATE_SLOT" = "fixture-a"
+          test -f candidate.txt
+          test ! -L candidate.txt
+          test ! -x candidate.txt
+          test "$(wc -c < candidate.txt)" -le 4096
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("candidate.txt").read_text(encoding="utf-8")
+          PY
+          mkdir -p attested-output
+          install -m 0644 candidate.txt attested-output/candidate.txt
+          candidate_sha256="$(sha256sum attested-output/candidate.txt | cut -d' ' -f1)"
+          jq -n \
+            --arg schema "white01-provenance-producer-receipt-v1" \
+            --arg repository "$CALLER_REPOSITORY" \
+            --arg source_ref "$CALLER_REF" \
+            --arg source_sha "$CALLER_SHA" \
+            --arg candidate_sha256 "$candidate_sha256" \
+            '{schema:$schema, repository:$repository, source_ref:$source_ref, source_sha:$source_sha, candidate_sha256:$candidate_sha256}' \
+            > attested-output/producer-receipt.json
+
+      - name: Generate authentic GitHub provenance
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: attested-output/candidate.txt
+
+      - name: Stage the exact Sigstore bundle
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -f "$BUNDLE_PATH"
+          install -m 0644 "$BUNDLE_PATH" attested-output/attestation.sigstore.json
+          sha256sum \
+            attested-output/candidate.txt \
+            attested-output/attestation.sigstore.json \
+            attested-output/producer-receipt.json \
+            > attested-output/SHA256SUMS
+
+      - name: Publish the immutable candidate artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: white01-provenance-fixture-a
+          path: attested-output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
